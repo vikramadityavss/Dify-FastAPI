@@ -47,7 +47,8 @@ def fetch_complete_hedge_data(
             supabase.table("waterfall_logic_configuration")
             .select("*")
             .eq("active_flag", "Y")
-            .order("waterfall_type", "priority_level")
+            .order("waterfall_type")
+            .order("priority_level")
         )
         
         # Overlay Configuration - for manual adjustments
