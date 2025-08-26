@@ -180,7 +180,7 @@ def fetch_complete_hedge_data(
 
         # Match instrument to the exposure currency: in pair OR as base/quote
         hi_q = hi_q.or_(
-            f"base_currency.eq.{exposure_currency},quote_currency.eq.{exposure_currency},currency_pair.cs.{exposure_currency}"
+            f"base_currency.eq.{exposure_currency},quote_currency.eq.{exposure_currency},currency_pair.eq.{exposure_currency}"
         )
 
         # Match currency classification if provided (Matched/Mismatched/…)
