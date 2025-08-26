@@ -11,65 +11,78 @@ def fetch_entity_and_nav_info(
 ):
     supabase = get_supabase()
     try:
-        # Join entity_master with currency_configuration to get currencytype
+        # Join entity_master with currency_configuration to get currency_type
         if currency_type:
             entities_query = (
                 supabase.table("entity_master")
-                .select("*, currency_configuration!inner(currencytype)")
-                .eq("currencycode", exposure_currency)
-                .eq("currency_configuration.currencytype", currency_type)
+                .select("*, currency_configuration!inner(currency_type)")
+                .eq("currency_code", exposure_currency)
+                .eq("currency_configuration.currency_type", currency_type)
             )
         else:
             entities_query = (
                 supabase.table("entity_master") 
-                .select("*, currency_configuration(currencytype)")
-                .eq("currencycode", exposure_currency)
+                .select("*, currency_configuration(currency_type)")
+                .eq("currency_code", exposure_currency)
             )
         
-        # Position queries with correct table names
-        positions_query = supabase.table("position_nav_master").select("*").eq("currencycode", exposure_currency)
+        # Position queries with correct table and field names
+        positions_query = supabase.table("position_nav_master").select("*").eq("currency_code", exposure_currency)
         if nav_type:
-            positions_query = positions_query.eq("navtype", nav_type)
+            positions_query = positions_query.eq("nav_type", nav_type)
         
         # Get USD PB threshold from threshold_configuration table
-        threshold_query = supabase.table("threshold_configuration").select("warninglevel").eq("thresholdtype", "USDPBDEPOSIT").eq("currencycode", "USD")
-        
-        # USD PB deposits query
-        usd_pb_query = supabase.table("usd_pb_deposit").select("*").eq("currencycode", exposure_currency)
-        
-        # Currency config and rates with correct table names
-        currency_config_q = supabase.table("currency_configuration").select("*").or_(
-            f"currencycode.eq.{exposure_currency},proxycurrency.eq.{exposure_currency},basecurrency.eq.{exposure_currency}"
+        threshold_query = (
+            supabase.table("threshold_configuration")
+            .select("warning_level")
+            .eq("threshold_type", "USD_PB_DEPOSIT")
+            .eq("currency_code", "USD")
         )
         
-        # Currency rates with correct table names
-        currency_rates_q = supabase.table("currency_rates").select("*").or_(
-            f"currencypair.eq.{exposure_currency}SGD,currencypair.eq.SGD{exposure_currency}"
-        ).order("effectivedate", desc=True)
+        # USD PB deposits query - using correct table name
+        usd_pb_query = supabase.table("usd_pb_deposit").select("*")
         
-        # Get proxy currencies
+        # Currency config with correct field names
+        currency_config_q = supabase.table("currency_configuration").select("*").or_(
+            f"currency_code.eq.{exposure_currency},proxy_currency.eq.{exposure_currency}"
+        )
+        
+        # Currency rates - need to create this table or find the correct table name
+        # Based on the schema, there might be a separate currency rates table
+        # For now, using a placeholder - you may need to adjust this
+        currency_rates_q = supabase.table("currency_rates").select("*").or_(
+            f"currency_pair.eq.{exposure_currency}SGD,currency_pair.eq.SGD{exposure_currency}"
+        ).order("effective_date", desc=True).limit(10)
+        
+        # Get proxy currencies from currency_configuration
         currency_config = currency_config_q.execute()
         currency_config_rows = getattr(currency_config, "data", [])
         proxy_currencies = set()
         for c in currency_config_rows:
-            if c.get("proxycurrency"):
-                proxy_currencies.add(c["proxycurrency"])
-            if c.get("basecurrency"):
-                proxy_currencies.add(c["basecurrency"])
+            if c.get("proxy_currency"):
+                proxy_currencies.add(c["proxy_currency"])
         
         # Additional rates for proxy currencies
         additional_rates_rows = []
         for proxy_ccy in proxy_currencies:
             if proxy_ccy and proxy_ccy != exposure_currency:
                 rate_query = supabase.table("currency_rates").select("*").or_(
-                    f"currencypair.eq.{proxy_ccy}SGD,currencypair.eq.SGD{proxy_ccy}"
-                ).order("effectivedate", desc=True)
+                    f"currency_pair.eq.{proxy_ccy}SGD,currency_pair.eq.SGD{proxy_ccy}"
+                ).order("effective_date", desc=True).limit(5)
                 rate_result = rate_query.execute()
                 additional_rates_rows += getattr(rate_result, "data", [])
 
         # Booking model and murex books queries with correct table names
-        booking_model_q = supabase.table("instruction_event_config").select("*").eq("instructionevent", "Inception")
-        murex_books_q = supabase.table("murex_book_config").select("*").eq("activeflag", True)
+        booking_model_q = (
+            supabase.table("instruction_event_config")
+            .select("*")
+            .eq("instruction_event", "Inception")
+        )
+        murex_books_q = (
+            supabase.table("murex_book_config")
+            .select("*")
+            .eq("active_flag", True)
+        )
 
         # Execute all queries
         entities = entities_query.execute()
@@ -83,7 +96,6 @@ def fetch_entity_and_nav_info(
         entities_rows = getattr(entities, "data", [])
         positions_rows = getattr(positions, "data", [])
         total_usd_pb_deposits_rows = getattr(usd_pb, "data", [])
-        currency_config_rows = getattr(currency_config, "data", [])
         currency_rates_rows = getattr(currency_rates, "data", [])
         booking_model_config_rows = getattr(booking_models, "data", [])
         murex_books_rows = getattr(murex_books, "data", [])
@@ -91,7 +103,7 @@ def fetch_entity_and_nav_info(
         # Get threshold value dynamically from database
         USD_PB_THRESHOLD = 150000  # default fallback
         if threshold_result.data:
-            USD_PB_THRESHOLD = threshold_result.data[0].get("warninglevel", 150000)
+            USD_PB_THRESHOLD = threshold_result.data[0].get("warning_level", 150000)
 
         return structured_response(
             entities_rows, positions_rows, total_usd_pb_deposits_rows,
@@ -126,11 +138,11 @@ def structured_response(
         currency_type = None
         if "currency_configuration" in e and e["currency_configuration"]:
             if isinstance(e["currency_configuration"], list):
-                currency_type = e["currency_configuration"][0].get("currencytype") if e["currency_configuration"] else None
+                currency_type = e["currency_configuration"][0].get("currency_type") if e["currency_configuration"] else None
             else:
-                currency_type = e["currency_configuration"].get("currencytype")
+                currency_type = e["currency_configuration"].get("currency_type")
         
-        entity_info_lookup[e["entityid"]] = {
+        entity_info_lookup[e["entity_id"]] = {
             **e,
             "currency_type": currency_type
         }
@@ -138,13 +150,15 @@ def structured_response(
     # Group positions by entity using correct field names
     grouped = defaultdict(list)
     for pos in positions_rows:
-        grouped[pos["entityid"]].append({
-            "nav_type": pos.get("navtype", ""),
-            "current_position": pos.get("currentposition", 0),
-            "coi_amount": pos.get("coiamount", 0),
-            "re_amount": pos.get("reamount", 0),
-            "buffer_pct": pos.get("bufferpct", 0),
-            "buffer_amount": pos.get("bufferamount", 0),
+        grouped[pos["entity_id"]].append({
+            "nav_type": pos.get("nav_type", ""),
+            "current_position": pos.get("current_position", 0),
+            "computed_total_nav": pos.get("computed_total_nav", 0),
+            "optimal_car_amount": pos.get("optimal_car_amount", 0),
+            "buffer_percentage": pos.get("buffer_percentage", 0),
+            "buffer_amount": pos.get("buffer_amount", 0),
+            "manual_overlay": pos.get("manual_overlay", 0),
+            "allocation_status": pos.get("allocation_status", "Pending"),
         })
     
     entity_groups = []
@@ -152,17 +166,19 @@ def structured_response(
         entity = entity_info_lookup.get(entity_id, {})
         entity_groups.append({
             "entity_id": entity_id,
-            "entity_type": entity.get("entitytype", ""),
-            "exposure_currency": entity.get("currencycode", ""),
+            "entity_name": entity.get("entity_name", ""),
+            "entity_type": entity.get("entity_type", ""),
+            "exposure_currency": entity.get("currency_code", ""),
             "currency_type": entity.get("currency_type", ""),
-            "car_exemption": entity.get("carexemptionflag", ""),
+            "car_exemption": entity.get("car_exemption_flag", ""),
+            "parent_child_nav_link": entity.get("parent_child_nav_link", False),
             "positions": navs
         })
 
-    # USD PB Check - you'll need to verify the correct field name for amount
+    # USD PB Check - using correct field names from usd_pb_deposit table
     total_usd_pb = 0
     for row in total_usd_pb_deposits_rows:
-        amount = row.get("amount") or row.get("deposit_amount") or 0  # check multiple possible field names
+        amount = row.get("total_usd_deposits", 0)
         try:
             total_usd_pb += float(amount)
         except Exception:
