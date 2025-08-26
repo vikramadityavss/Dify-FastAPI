@@ -5,26 +5,38 @@ def fetch_entity_and_nav_info(
     exposure_currency: str,
     hedge_method: str,
     hedge_amount_order: float,
-    order_id: str
+    order_id: str,
+    nav_type: str = None,  # Added nav_type parameter
+    currency_type: str = None  # Added currency_type parameter
 ):
     supabase = get_supabase()
     try:
-        # Entities and positions (COI, RE, etc.)
-        entities_q = supabase.table("entity_master").select("*").eq("currency_code", exposure_currency)
-        positions_q = supabase.table("position_nav_master").select("*").eq("currency_code", exposure_currency)
-        usd_pb_q = supabase.table("usd_pb_deposit").select("*").eq("currency_code", exposure_currency)
+        # Entities and positions (COI, RE, etc.) with currency_type filter
+        entities_query = supabase.table("entity_master").select("*").eq("currency_code", exposure_currency)
+        if currency_type:
+            entities_query = entities_query.eq("currency_type", currency_type)
+        
+        positions_query = supabase.table("position_nav_master").select("*").eq("currency_code", exposure_currency)
+        if nav_type:
+            positions_query = positions_query.eq("nav_type", nav_type)
+        if currency_type:
+            positions_query = positions_query.eq("currency_type", currency_type)
+        
+        usd_pb_query = supabase.table("usd_pb_deposit").select("*").eq("currency_code", exposure_currency)
+        if currency_type:
+            usd_pb_query = usd_pb_query.eq("currency_type", currency_type)
         
         # Currency config for all in-scope currencies (exact columns)
         currency_config_q = supabase.table("currency_configuration").select("*").or_(
             f"currency_code.eq.{exposure_currency},proxy_currency.eq.{exposure_currency},base_currency.eq.{exposure_currency}"
         )
         
-        # Rates for exposure currency in both directions (fix column name to 'effective_date')
+        # Rates for exposure currency in both directions
         currency_rates_q = supabase.table("currency_rates").select("*").or_(
             f"currency_pair.eq.{exposure_currency}-SGD,currency_pair.eq.SGD-{exposure_currency}"
         ).order("effective_date", desc=True)
         
-        # Additional rates for proxy/base currencies from config, FIX column name to 'effective_date'
+        # Additional rates for proxy/base currencies from config
         currency_config = currency_config_q.execute()
         currency_config_rows = getattr(currency_config, "data", [])
         proxy_currencies = set()
@@ -33,6 +45,7 @@ def fetch_entity_and_nav_info(
                 proxy_currencies.add(c["proxy_currency"])
             if c.get("base_currency"):
                 proxy_currencies.add(c["base_currency"])
+        
         additional_rates_rows = []
         for proxy_ccy in proxy_currencies:
             if proxy_ccy and proxy_ccy != exposure_currency:
@@ -47,9 +60,9 @@ def fetch_entity_and_nav_info(
         murex_books_q = supabase.table("murex_book_config").select("*").eq("active_flag", True)
 
         # Execute all queries
-        entities = entities_q.execute()
-        positions = positions_q.execute()
-        usd_pb = usd_pb_q.execute()
+        entities = entities_query.execute()
+        positions = positions_query.execute()
+        usd_pb = usd_pb_query.execute()
         currency_rates = currency_rates_q.execute()
         booking_models = booking_model_q.execute()
         murex_books = murex_books_q.execute()
@@ -95,12 +108,14 @@ def structured_response(
     for pos in positions_rows:
         grouped[pos["entity_id"]].append({
             "nav_type": pos.get("nav_type", ""),
+            "currency_type": pos.get("currency_type", ""),  # Added currency_type to output
             "current_position": pos.get("current_position", 0),
             "coi_amount": pos.get("coi_amount", 0),
             "re_amount": pos.get("re_amount", 0),
             "buffer_pct": pos.get("buffer_pct", 0),
             "buffer_amount": pos.get("buffer_amount", 0),
         })
+    
     entity_groups = []
     for entity_id, navs in grouped.items():
         entity = entity_info_lookup.get(entity_id, {})
@@ -108,6 +123,7 @@ def structured_response(
             "entity_id": entity_id,
             "entity_type": entity.get("entity_type", ""),
             "exposure_currency": entity.get("currency_code", ""),
+            "currency_type": entity.get("currency_type", ""),  # Added currency_type to entity output
             "car_exemption": entity.get("car_exemption_flag", ""),
             "positions": navs
         })
@@ -120,6 +136,7 @@ def structured_response(
             total_usd_pb += float(amount)
         except Exception:
             pass
+    
     usd_pb_check = {
         "total_usd_equivalent": total_usd_pb,
         "threshold": USD_PB_THRESHOLD,

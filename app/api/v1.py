@@ -10,7 +10,9 @@ def validate_and_book_hedge_inception(payload: HedgeInceptionInstruction):
         exposure_currency=payload.exposure_currency,
         hedge_method=payload.hedge_method,
         hedge_amount_order=payload.hedge_amount_order,
-        order_id=payload.order_id
+        order_id=payload.order_id,
+        nav_type=getattr(payload, 'nav_type', None),  # Added nav_type
+        currency_type=getattr(payload, 'currency_type', None)  # Added currency_type
     )
     return {
         "status": "received",
