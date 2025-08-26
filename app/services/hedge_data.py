@@ -213,7 +213,7 @@ def fetch_complete_hedge_data(
             supabase.table("hedge_effectiveness")
             .select("*")
             .eq("currency_code", exposure_currency)
-            .order("effectiveness_date", desc=True)
+            .order("measurement_date", desc=True)
             .limit(10)
         )
 
