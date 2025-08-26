@@ -1,6 +1,42 @@
 from collections import defaultdict
 from app.services.supabase_client import get_supabase
 
+# ---------------------------
+# Small safety helpers
+# ---------------------------
+
+def _sample_columns(supabase, table_name: str) -> set:
+    """
+    Fetch 1 row to discover columns. Returns a set of column names (exact case as returned).
+    If anything fails, returns empty set.
+    """
+    try:
+        r = supabase.table(table_name).select("*").limit(1).execute()
+        row = (r.data or [None])[0]
+        return set((row or {}).keys())
+    except Exception:
+        return set()
+
+def _order_if_exists(supabase, table_name: str, base_query, candidates, desc=True):
+    """
+    Apply ORDER BY using the first existing column in `candidates`.
+    If none exist, returns base_query unchanged.
+    """
+    cols = _sample_columns(supabase, table_name)
+    for c in candidates:
+        if c in cols:
+            return base_query.order(c, desc=desc)
+    return base_query
+
+def _eq_if_exists(supabase, table_name: str, base_query, column: str, value):
+    """
+    Apply .eq(column, value) only if the column exists; otherwise return base_query unchanged.
+    """
+    cols = _sample_columns(supabase, table_name)
+    if column in cols:
+        return base_query.eq(column, value)
+    return base_query
+
 def fetch_complete_hedge_data(
     exposure_currency: str,
     hedge_method: str,
@@ -11,8 +47,8 @@ def fetch_complete_hedge_data(
 ):
     supabase = get_supabase()
     try:
-        # ===== CORE ENTITY AND POSITION DATA (EXECUTE FIRST) =====
-        # Join entity_master with currency_configuration to get currency_type
+        # ===== CORE ENTITY AND POSITION DATA =====
+        # entity_master ⨯ currency_configuration (for currency_type)
         if currency_type:
             entities_query = (
                 supabase.table("entity_master")
@@ -27,20 +63,21 @@ def fetch_complete_hedge_data(
                 .eq("currency_code", exposure_currency)
             )
 
-        positions_query = supabase.table("position_nav_master").select("*").eq("currency_code", exposure_currency)
+        positions_query = (
+            supabase.table("position_nav_master")
+            .select("*")
+            .eq("currency_code", exposure_currency)
+        )
         if nav_type:
             positions_query = positions_query.eq("nav_type", nav_type)
 
+        # Execute early so we can derive entity_ids for later filters
         entities = entities_query.execute()
         positions = positions_query.execute()
-
         entities_rows = getattr(entities, "data", []) or []
         positions_rows = getattr(positions, "data", []) or []
-
-        # Build a stable set of entity_ids we care about
         entity_ids = {e["entity_id"] for e in entities_rows if e.get("entity_id")}
         if not entity_ids:
-            # fallback: derive from positions if entities filtered out by currency_type
             entity_ids = {p["entity_id"] for p in positions_rows if p.get("entity_id")}
 
         # ===== STAGE 1A: CONFIGURATION TABLES =====
@@ -55,8 +92,13 @@ def fetch_complete_hedge_data(
             supabase.table("waterfall_logic_configuration")
             .select("*")
             .eq("active_flag", "Y")
-            .order("waterfall_type")
-            .order("priority_level")
+        )
+        waterfall_config_query = _order_if_exists(
+            supabase,
+            "waterfall_logic_configuration",
+            waterfall_config_query,
+            candidates=["waterfall_type", "priority_level", "created_date", "created_at"],
+            desc=False  # waterfall_type then priority usually ASC
         )
 
         overlay_config_query = (
@@ -80,32 +122,62 @@ def fetch_complete_hedge_data(
             supabase.table("allocation_engine")
             .select("*")
             .eq("currency_code", exposure_currency)
-            .order("created_date", desc=True)
-            .limit(100)
         )
+        allocation_query = _order_if_exists(
+            supabase,
+            "allocation_engine",
+            allocation_query,
+            candidates=["created_date", "created_at", "updated_at", "modified_date"],
+            desc=True
+        ).limit(100)
 
         hedge_instructions_query = (
             supabase.table("hedge_instructions")
             .select("*")
             .eq("exposure_currency", exposure_currency)
-            .order("created_date", desc=True)
-            .limit(50)
         )
+        hedge_instructions_query = _order_if_exists(
+            supabase,
+            "hedge_instructions",
+            hedge_instructions_query,
+            candidates=["created_date", "created_at", "instruction_date", "updated_at"],
+            desc=True
+        ).limit(50)
 
-        # IMPORTANT: hedge_business_events may NOT have exposure_currency
-        # Prefer entity scope; if none, fall back to currency_code if present, else no filter.
-        hedge_events_query = supabase.table("hedge_business_events").select("*").order("nav_type", desc=True).limit(50)
+        # hedge_business_events: no 'exposure_currency', no 'event_date' in your schema
+        hedge_events_query = supabase.table("hedge_business_events").select("*").limit(50)
+        # Prefer entity scope; it's the most reliable on event tables
         if entity_ids:
             hedge_events_query = hedge_events_query.in_("entity_id", list(entity_ids))
-        else:
-            # try currency_code filter if the table has it (we’ll “try/except” on execute)
-            hedge_events_query = hedge_events_query.eq("currency_code", exposure_currency)
+        # Optionally filter by nav_type if present
+        if nav_type:
+            hedge_events_query = _eq_if_exists(
+                supabase, "hedge_business_events", hedge_events_query, "nav_type", nav_type
+            )
+        # Order by first available timestamp-like column
+        hedge_events_query = _order_if_exists(
+            supabase,
+            "hedge_business_events",
+            hedge_events_query,
+            candidates=[
+                "created_date", "created_at", "updated_date", "updated_at",
+                "event_timestamp", "event_time", "event_at"
+            ],
+            desc=True
+        )
 
+        # CAR master: your error shows `effective_date` not present → use typical alternatives
         car_master_query = (
             supabase.table("car_master")
             .select("*")
             .eq("currency_code", exposure_currency)
-            .order("effective_date", desc=True)
+        )
+        car_master_query = _order_if_exists(
+            supabase,
+            "car_master",
+            car_master_query,
+            candidates=["reporting_date", "as_of_date", "effective_date", "created_date", "created_at"],
+            desc=True
         )
 
         # ===== STAGE 1A: THRESHOLD AND MONITORING =====
@@ -123,7 +195,7 @@ def fetch_complete_hedge_data(
             .eq("monitoring_status", "Active")
         )
 
-        # ===== CURRENCY AND RATES DATA =====
+        # ===== CURRENCY & RATES =====
         currency_config_q = supabase.table("currency_configuration").select("*").or_(
             f"currency_code.eq.{exposure_currency},proxy_currency.eq.{exposure_currency}"
         )
@@ -132,9 +204,14 @@ def fetch_complete_hedge_data(
             supabase.table("currency_rates")
             .select("*")
             .or_(f"currency_pair.eq.{exposure_currency}SGD,currency_pair.eq.SGD{exposure_currency}")
-            .order("effective_date", desc=True)
-            .limit(20)
         )
+        currency_rates_q = _order_if_exists(
+            supabase,
+            "currency_rates",
+            currency_rates_q,
+            candidates=["effective_date", "rate_date", "as_of_date", "created_at"],
+            desc=True
+        ).limit(20)
 
         proxy_config_query = (
             supabase.table("proxy_configuration")
@@ -143,18 +220,24 @@ def fetch_complete_hedge_data(
             .eq("active_flag", "Y")
         )
 
-        # ===== STAGE 2: BOOKING AND EXECUTION =====
+        # ===== STAGE 2: BOOKING & EXECUTION =====
         booking_model_q = (
             supabase.table("instruction_event_config")
             .select("*")
             .eq("instruction_event", "Initiation")
         )
         if nav_type:
-            booking_model_q = booking_model_q.eq("nav_type", nav_type)
+            booking_model_q = _eq_if_exists(supabase, "instruction_event_config", booking_model_q, "nav_type", nav_type)
         if currency_type:
-            booking_model_q = booking_model_q.eq("currency_type", currency_type)
+            booking_model_q = _eq_if_exists(supabase, "instruction_event_config", booking_model_q, "currency_type", currency_type)
 
-        murex_books_q = supabase.table("murex_book_config").select("*").eq("active_flag", True)
+        murex_books_q = (
+            supabase.table("murex_book_config")
+            .select("*")
+        )
+        # active flag could be boolean or 'Y'
+        murex_books_q = _eq_if_exists(supabase, "murex_book_config", murex_books_q, "active_flag", True)
+        murex_books_q = _eq_if_exists(supabase, "murex_book_config", murex_books_q, "active_flag", "Y")
 
         hedge_instruments_query = (
             supabase.table("hedge_instruments")
@@ -167,11 +250,16 @@ def fetch_complete_hedge_data(
             supabase.table("hedge_effectiveness")
             .select("*")
             .eq("currency_code", exposure_currency)
-            .order("effectiveness_date", desc=True)
-            .limit(10)
         )
+        hedge_effectiveness_query = _order_if_exists(
+            supabase,
+            "hedge_effectiveness",
+            hedge_effectiveness_query,
+            candidates=["effectiveness_date", "as_of_date", "created_at"],
+            desc=True
+        ).limit(10)
 
-        # ===== PROXY CURRENCIES HANDLING =====
+        # ===== PROXY CURRENCIES (extra rates) =====
         currency_config = currency_config_q.execute()
         currency_config_rows = getattr(currency_config, "data", []) or []
         proxy_currencies = {c.get("proxy_currency") for c in currency_config_rows if c.get("proxy_currency")}
@@ -183,10 +271,14 @@ def fetch_complete_hedge_data(
                 supabase.table("currency_rates")
                 .select("*")
                 .or_(f"currency_pair.eq.{proxy_ccy}SGD,currency_pair.eq.SGD{proxy_ccy}")
-                .order("effective_date", desc=True)
-                .limit(10)
-                .execute()
             )
+            rate_result = _order_if_exists(
+                supabase,
+                "currency_rates",
+                rate_result,
+                candidates=["effective_date", "rate_date", "as_of_date", "created_at"],
+                desc=True
+            ).limit(10).execute()
             additional_rates_rows += getattr(rate_result, "data", []) or []
 
         # ===== EXECUTE REMAINING QUERIES =====
@@ -199,12 +291,11 @@ def fetch_complete_hedge_data(
         allocations = allocation_query.execute()
         hedge_instructions = hedge_instructions_query.execute()
 
-        # Hedge events: try with our preferred filter; if it fails due to column, retry without that filter
         try:
             hedge_events = hedge_events_query.execute()
-        except Exception as err:
-            # Retry with minimal filtering
-            hedge_events = supabase.table("hedge_business_events").select("*").order("event_date", desc=True).limit(50).execute()
+        except Exception:
+            # Fallback to no filters if some optimistic filter still failed
+            hedge_events = supabase.table("hedge_business_events").select("*").limit(50).execute()
 
         car_master = car_master_query.execute()
 
@@ -220,7 +311,7 @@ def fetch_complete_hedge_data(
         hedge_instruments = hedge_instruments_query.execute()
         hedge_effectiveness = hedge_effectiveness_query.execute()
 
-        # ===== EXTRACT DATA =====
+        # ===== EXTRACT ROWS =====
         buffer_config_rows = getattr(buffer_config, "data", []) or []
         waterfall_config_rows = getattr(waterfall_config, "data", []) or []
         overlay_config_rows = getattr(overlay_config, "data", []) or []
@@ -241,6 +332,7 @@ def fetch_complete_hedge_data(
         hedge_instruments_rows = getattr(hedge_instruments, "data", []) or []
         hedge_effectiveness_rows = getattr(hedge_effectiveness, "data", []) or []
 
+        # Threshold fallback
         USD_PB_THRESHOLD = 150000
         if getattr(threshold_result, "data", None):
             USD_PB_THRESHOLD = threshold_result.data[0].get("warning_level", 150000)
@@ -290,50 +382,51 @@ def complete_structured_response(
     # Process entities with currency_type from joined data
     entity_info_lookup = {}
     for e in entities_rows:
-        currency_type = None
+        c_type = None
         if "currency_configuration" in e and e["currency_configuration"]:
             if isinstance(e["currency_configuration"], list):
-                currency_type = e["currency_configuration"][0].get("currency_type") if e["currency_configuration"] else None
+                c_type = e["currency_configuration"][0].get("currency_type") if e["currency_configuration"] else None
             else:
-                currency_type = e["currency_configuration"].get("currency_type")
+                c_type = e["currency_configuration"].get("currency_type")
+        if e.get("entity_id"):
+            entity_info_lookup[e["entity_id"]] = {**e, "currency_type": c_type}
 
-        entity_info_lookup[e["entity_id"]] = {**e, "currency_type": currency_type}
-
-    # Process allocation data by entity
+    # Allocations by entity
     allocation_lookup = defaultdict(list)
     for alloc in allocations_rows:
-        if alloc.get("entity_id"):
-            allocation_lookup[alloc["entity_id"]].append(alloc)
+        eid = alloc.get("entity_id")
+        if eid:
+            allocation_lookup[eid].append(alloc)
 
-    # Process hedge events by entity
+    # Hedge events by entity
     hedge_relationships = defaultdict(list)
     for event in hedge_events_rows:
         eid = event.get("entity_id")
         if eid:
             hedge_relationships[eid].append(event)
 
-    # Process framework rules by entity
+    # Framework rules by entity
     framework_rules = {}
     for rule in hedging_framework_rows:
         eid = rule.get("entity_id")
         if eid:
             framework_rules[eid] = rule
 
-    # Process buffer configuration by entity
+    # Buffer rules by entity
     buffer_rules = {}
-    for buffer in buffer_config_rows:
-        eid = buffer.get("entity_id")
+    for br in buffer_config_rows:
+        eid = br.get("entity_id")
         if eid:
-            buffer_rules[eid] = buffer
+            buffer_rules[eid] = br
 
-    # Process CAR data by entity
+    # CAR data by entity (latest row is already preferred due to ordering)
     car_data = {}
     for car in car_master_rows:
         eid = car.get("entity_id")
-        if eid:
+        if eid and eid not in car_data:
             car_data[eid] = car
 
-    # Group positions by entity with complete hedging state
+    # Group positions by entity and compute hedging state
     grouped = defaultdict(list)
     for pos in positions_rows:
         eid = pos.get("entity_id")
@@ -398,7 +491,7 @@ def complete_structured_response(
         "excess_amount": max(0.0, total_usd_pb - USD_PB_THRESHOLD)
     }
 
-    # Organize waterfall configuration by type
+    # Waterfall config split
     waterfall_rules = {
         "opening": [w for w in (waterfall_config_rows or []) if w.get("waterfall_type") == "Opening"],
         "closing": [w for w in (waterfall_config_rows or []) if w.get("waterfall_type") == "Closing"]
@@ -420,7 +513,7 @@ def complete_structured_response(
         "stage_1b_data": {
             "current_allocations": allocations_rows,
             "hedge_instructions_history": hedge_instructions_rows,
-            "active_hedge_events": hedge_relationships,  # keyed by entity_id for convenience
+            "active_hedge_events": hedge_relationships,  # keyed by entity_id
             "car_master_data": car_master_rows
         },
         "stage_2_config": {
@@ -437,6 +530,7 @@ def complete_structured_response(
     }
 
 def calculate_complete_hedging_state(position, allocation, hedge_relationships, framework_rule, buffer_rule, car_info):
+    """Calculate comprehensive hedging state for an entity position"""
     current_position = float(position.get("current_position", 0) or 0)
     allocated_amount = float(allocation.get("hedge_amount_allocation", 0) or 0)
     available_for_hedging = float(allocation.get("available_amount_for_hedging", 0) or 0)
@@ -458,10 +552,10 @@ def calculate_complete_hedging_state(position, allocation, hedge_relationships, 
         hedging_status = "Not_Available"
 
     framework_type = framework_rule.get("framework_type", "Not_Defined")
-    # prefer rule buffer % if present; else fallback to position buffer % if you carry it there
     buffer_percentage = buffer_rule.get("buffer_percentage", position.get("buffer_percentage", 0))
     car_exemption = framework_rule.get("car_exemption_flag", framework_rule.get("car_exemption_override", "N"))
 
+    # Available Amount = SFX Position - CAR Amount + Manual Overlay - Buffer Amount - Hedged Position
     calculated_available = current_position - car_amount + manual_overlay - buffer_amount - hedged_position
 
     return {
