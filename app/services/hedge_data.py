@@ -168,7 +168,7 @@ def fetch_complete_hedge_data(
             .eq("active_flag", True)   # boolean per schema
         )
 
-        # ===== hedge_instruments (FIXED to your schema) =====
+        # ===== hedge_instruments (EXACT MATCHES ONLY — no .cs / @>) =====
         hi_q = supabase.table("hedge_instruments").select("*")
 
         # Active and effective
@@ -178,12 +178,20 @@ def fetch_complete_hedge_data(
             .lte("effective_date", today)
         )
 
-        # Match instrument to the exposure currency: in pair OR as base/quote
-        hi_q = hi_q.or_(
-            f"base_currency.eq.{exposure_currency},quote_currency.eq.{exposure_currency},currency_pair.eq.{exposure_currency}"
+        # Build an OR clause that uses only exact equals
+        # - base_currency == exposure_currency
+        # - quote_currency == exposure_currency
+        # - currency_pair in (EXPOSURESGD, SGDEXPOSURE)
+        pair1 = f"{exposure_currency}SGD"
+        pair2 = f"SGD{exposure_currency}"
+        or_clause = (
+            f"base_currency.eq.{exposure_currency},"
+            f"quote_currency.eq.{exposure_currency},"
+            f"currency_pair.in.({pair1},{pair2})"
         )
+        hi_q = hi_q.or_(or_clause)
 
-        # Match currency classification if provided (Matched/Mismatched/…)
+        # Match currency classification if provided
         if currency_type:
             hi_q = hi_q.eq("currency_classification", currency_type)
 
@@ -199,7 +207,6 @@ def fetch_complete_hedge_data(
         else:
             hi_q = hi_q.in_("accounting_method_supported", ["Both", "COH", "MTM"])
 
-        # Prefer most recent instruments first
         hedge_instruments_query = hi_q.order("effective_date", desc=True)
 
         hedge_effectiveness_query = (
