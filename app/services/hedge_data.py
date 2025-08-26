@@ -76,8 +76,14 @@ def fetch_entity_and_nav_info(
         booking_model_q = (
             supabase.table("instruction_event_config")
             .select("*")
-            .eq("instruction_event", "Inception")
+            .eq("instruction_event", "Initiation")
         )
+        
+        # Add filters for nav_type and currency_type if provided
+        if nav_type:
+            booking_model_q = booking_model_q.eq("nav_type", nav_type)
+        if currency_type:
+            booking_model_q = booking_model_q.eq("currency_type", currency_type)
         murex_books_q = (
             supabase.table("murex_book_config")
             .select("*")
