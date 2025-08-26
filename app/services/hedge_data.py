@@ -94,14 +94,7 @@ def fetch_complete_hedge_data(
 
         # IMPORTANT: hedge_business_events may NOT have exposure_currency
         # Prefer entity scope; if none, fall back to currency_code if present, else no filter.
-       hedge_events_query = (
-    supabase.table("hedge_business_events")
-    .select("*")
-    .eq("nav_type", nav_type)        # COI / RE filter
-    .order("created_date", desc=True)
-    .limit(50)
-)
-
+        hedge_events_query = supabase.table("hedge_business_events").select("*").order("nav_type", desc=True).limit(50)
         if entity_ids:
             hedge_events_query = hedge_events_query.in_("entity_id", list(entity_ids))
         else:
