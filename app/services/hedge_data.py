@@ -13,7 +13,6 @@ def fetch_complete_hedge_data(
     supabase = get_supabase()
     try:
         # ===== CORE ENTITY AND POSITION DATA =====
-        # entity_master ⨯ currency_configuration (for currency_type)
         if currency_type:
             entities_query = (
                 supabase.table("entity_master")
@@ -36,7 +35,6 @@ def fetch_complete_hedge_data(
         if nav_type:
             positions_query = positions_query.eq("nav_type", nav_type)
 
-        # Execute early so we can derive entity_ids
         entities = entities_query.execute()
         positions = positions_query.execute()
         entities_rows = getattr(entities, "data", []) or []
@@ -57,8 +55,8 @@ def fetch_complete_hedge_data(
             supabase.table("waterfall_logic_configuration")
             .select("*")
             .eq("active_flag", "Y")
-            .order("waterfall_type")     # ASC
-            .order("priority_level")     # ASC
+            .order("waterfall_type")
+            .order("priority_level")
         )
 
         overlay_config_query = (
@@ -95,16 +93,15 @@ def fetch_complete_hedge_data(
             .limit(50)
         )
 
-        # --- EXACT SCHEMA: hedge_business_events ---
+        # hedge_business_events (schema-aligned)
         hedge_events_query = supabase.table("hedge_business_events").select("*").limit(50)
         if entity_ids:
             hedge_events_query = hedge_events_query.in_("entity_id", list(entity_ids))
         if nav_type:
             hedge_events_query = hedge_events_query.eq("nav_type", nav_type)
-        # prefer business dates first, then created_date
         hedge_events_query = hedge_events_query.order("trade_date", desc=True).order("created_date", desc=True)
 
-        # --- EXACT SCHEMA: car_master ---
+        # car_master (schema-aligned)
         car_master_query = (
             supabase.table("car_master")
             .select("*")
@@ -119,11 +116,9 @@ def fetch_complete_hedge_data(
             .eq("threshold_type", "USD_PB_DEPOSIT")
             .eq("active_flag", "Y")
         )
-
         usd_pb_query = supabase.table("usd_pb_deposit").select("*")
 
-        # --- EXACT SCHEMA: risk_monitoring ---
-        # show open items for this currency; optionally exclude 'Normal'
+        # risk_monitoring (schema-aligned)
         risk_monitoring_query = (
             supabase.table("risk_monitoring")
             .select("*")
@@ -145,7 +140,7 @@ def fetch_complete_hedge_data(
             .limit(20)
         )
 
-        # --- EXACT SCHEMA: proxy_configuration ---
+        # proxy_configuration (schema-aligned)
         today = date.today().isoformat()
         proxy_config_query = (
             supabase.table("proxy_configuration")
@@ -153,9 +148,8 @@ def fetch_complete_hedge_data(
             .eq("exposure_currency", exposure_currency)
             .eq("active_flag", "Y")
             .lte("effective_date", today)
+            .order("effective_date", desc=True)
         )
-        # keep most recent first
-        proxy_config_query = proxy_config_query.order("effective_date", desc=True)
 
         # ===== STAGE 2: BOOKING AND EXECUTION =====
         booking_model_q = (
@@ -171,15 +165,42 @@ def fetch_complete_hedge_data(
         murex_books_q = (
             supabase.table("murex_book_config")
             .select("*")
-            .eq("active_flag", True)   # boolean per your schema
+            .eq("active_flag", True)   # boolean per schema
         )
 
-        hedge_instruments_query = (
-            supabase.table("hedge_instruments")
-            .select("*")
-            .eq("currency_code", exposure_currency)
+        # ===== hedge_instruments (FIXED to your schema) =====
+        hi_q = supabase.table("hedge_instruments").select("*")
+
+        # Active and effective
+        hi_q = (
+            hi_q
             .eq("active_flag", "Y")
+            .lte("effective_date", today)
         )
+
+        # Match instrument to the exposure currency: in pair OR as base/quote
+        hi_q = hi_q.or_(
+            f"base_currency.eq.{exposure_currency},quote_currency.eq.{exposure_currency},currency_pair.cs.{exposure_currency}"
+        )
+
+        # Match currency classification if provided (Matched/Mismatched/…)
+        if currency_type:
+            hi_q = hi_q.eq("currency_classification", currency_type)
+
+        # Match nav_type_applicable (Both or exact)
+        if nav_type:
+            hi_q = hi_q.in_("nav_type_applicable", ["Both", nav_type])
+        else:
+            hi_q = hi_q.in_("nav_type_applicable", ["Both", "COI", "RE"])
+
+        # Match accounting_method_supported (Both or exact)
+        if hedge_method:
+            hi_q = hi_q.in_("accounting_method_supported", ["Both", hedge_method])
+        else:
+            hi_q = hi_q.in_("accounting_method_supported", ["Both", "COH", "MTM"])
+
+        # Prefer most recent instruments first
+        hedge_instruments_query = hi_q.order("effective_date", desc=True)
 
         hedge_effectiveness_query = (
             supabase.table("hedge_effectiveness")
@@ -299,7 +320,7 @@ def complete_structured_response(
     booking_model_config_rows, murex_books_rows, hedge_instruments_rows,
     hedge_effectiveness_rows
 ):
-    # Process entities with currency_type from joined data
+    # Entities with currency_type
     entity_info_lookup = {}
     for e in entities_rows:
         c_type = None
@@ -339,7 +360,7 @@ def complete_structured_response(
         if eid:
             buffer_rules[eid] = br
 
-    # CAR latest per entity (already ordered by reporting_date desc)
+    # CAR latest per entity (already ordered desc)
     car_data = {}
     for car in car_master_rows:
         eid = car.get("entity_id")
@@ -452,7 +473,7 @@ def complete_structured_response(
 def calculate_complete_hedging_state(position, allocation, hedge_relationships, framework_rule, buffer_rule, car_info):
     """Comprehensive hedging state for an entity position"""
     current_position = float(position.get("current_position", 0) or 0)
-    _ = float(allocation.get("hedge_amount_allocation", 0) or 0)  # kept for future use
+    _ = float(allocation.get("hedge_amount_allocation", 0) or 0)  # placeholder for future logic
     available_for_hedging = float(allocation.get("available_amount_for_hedging", 0) or 0)
     hedged_position = float(allocation.get("hedged_position", 0) or 0)
     car_amount = float(allocation.get("car_amount_distribution", 0) or 0)
