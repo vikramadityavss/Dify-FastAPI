@@ -1,27 +1,28 @@
 from collections import defaultdict
 from app.services.supabase_client import get_supabase
 
-# ---------------------------
-# Small safety helpers
-# ---------------------------
+# ============================================================
+# Helpers: schema-aware .order/.eq with a tiny column cache
+# ============================================================
+
+_COL_CACHE = {}
 
 def _sample_columns(supabase, table_name: str) -> set:
-    """
-    Fetch 1 row to discover columns. Returns a set of column names (exact case as returned).
-    If anything fails, returns empty set.
-    """
+    """Fetch 1 row to discover columns. Cached per table. Returns exact-case names."""
+    if table_name in _COL_CACHE:
+        return _COL_CACHE[table_name]
     try:
         r = supabase.table(table_name).select("*").limit(1).execute()
-        row = (r.data or [None])[0]
-        return set((row or {}).keys())
+        row = (getattr(r, "data", None) or [None])[0]
+        cols = set((row or {}).keys())
+        _COL_CACHE[table_name] = cols
+        return cols
     except Exception:
+        _COL_CACHE[table_name] = set()
         return set()
 
 def _order_if_exists(supabase, table_name: str, base_query, candidates, desc=True):
-    """
-    Apply ORDER BY using the first existing column in `candidates`.
-    If none exist, returns base_query unchanged.
-    """
+    """Apply ORDER BY using the first existing column in `candidates`."""
     cols = _sample_columns(supabase, table_name)
     for c in candidates:
         if c in cols:
@@ -29,13 +30,25 @@ def _order_if_exists(supabase, table_name: str, base_query, candidates, desc=Tru
     return base_query
 
 def _eq_if_exists(supabase, table_name: str, base_query, column: str, value):
-    """
-    Apply .eq(column, value) only if the column exists; otherwise return base_query unchanged.
-    """
-    cols = _sample_columns(supabase, table_name)
-    if column in cols:
+    """Apply .eq(column, value) only if the column exists."""
+    if column in _sample_columns(supabase, table_name):
         return base_query.eq(column, value)
     return base_query
+
+def _eq_any_if_exists(supabase, table_name: str, base_query, candidates_with_values):
+    """
+    Try multiple (column, value) pairs; apply the first whose column exists.
+    Example: [("monitoring_status","Active"),("status","Active"),("active_flag","Y")]
+    """
+    cols = _sample_columns(supabase, table_name)
+    for col, val in candidates_with_values:
+        if col in cols:
+            return base_query.eq(col, val)
+    return base_query
+
+# ============================================================
+# Main entry
+# ============================================================
 
 def fetch_complete_hedge_data(
     exposure_currency: str,
@@ -47,8 +60,7 @@ def fetch_complete_hedge_data(
 ):
     supabase = get_supabase()
     try:
-        # ===== CORE ENTITY AND POSITION DATA =====
-        # entity_master ⨯ currency_configuration (for currency_type)
+        # ===== CORE: ENTITIES & POSITIONS (run first) =====
         if currency_type:
             entities_query = (
                 supabase.table("entity_master")
@@ -71,16 +83,16 @@ def fetch_complete_hedge_data(
         if nav_type:
             positions_query = positions_query.eq("nav_type", nav_type)
 
-        # Execute early so we can derive entity_ids for later filters
         entities = entities_query.execute()
         positions = positions_query.execute()
         entities_rows = getattr(entities, "data", []) or []
         positions_rows = getattr(positions, "data", []) or []
+
         entity_ids = {e["entity_id"] for e in entities_rows if e.get("entity_id")}
         if not entity_ids:
             entity_ids = {p["entity_id"] for p in positions_rows if p.get("entity_id")}
 
-        # ===== STAGE 1A: CONFIGURATION TABLES =====
+        # ===== STAGE 1A CONFIG =====
         buffer_config_query = (
             supabase.table("buffer_configuration")
             .select("*")
@@ -94,11 +106,9 @@ def fetch_complete_hedge_data(
             .eq("active_flag", "Y")
         )
         waterfall_config_query = _order_if_exists(
-            supabase,
-            "waterfall_logic_configuration",
-            waterfall_config_query,
+            supabase, "waterfall_logic_configuration", waterfall_config_query,
             candidates=["waterfall_type", "priority_level", "created_date", "created_at"],
-            desc=False  # waterfall_type then priority usually ASC
+            desc=False
         )
 
         overlay_config_query = (
@@ -117,16 +127,14 @@ def fetch_complete_hedge_data(
 
         system_config_query = supabase.table("system_configuration").select("*").eq("active_flag", "Y")
 
-        # ===== STAGE 1A & 1B: ALLOCATION AND HEDGE DATA =====
+        # ===== STAGE 1A & 1B DATA =====
         allocation_query = (
             supabase.table("allocation_engine")
             .select("*")
             .eq("currency_code", exposure_currency)
         )
         allocation_query = _order_if_exists(
-            supabase,
-            "allocation_engine",
-            allocation_query,
+            supabase, "allocation_engine", allocation_query,
             candidates=["created_date", "created_at", "updated_at", "modified_date"],
             desc=True
         ).limit(100)
@@ -137,50 +145,36 @@ def fetch_complete_hedge_data(
             .eq("exposure_currency", exposure_currency)
         )
         hedge_instructions_query = _order_if_exists(
-            supabase,
-            "hedge_instructions",
-            hedge_instructions_query,
+            supabase, "hedge_instructions", hedge_instructions_query,
             candidates=["created_date", "created_at", "instruction_date", "updated_at"],
             desc=True
         ).limit(50)
 
-        # hedge_business_events: no 'exposure_currency', no 'event_date' in your schema
+        # hedge_business_events — NO exposure_currency / event_date
         hedge_events_query = supabase.table("hedge_business_events").select("*").limit(50)
-        # Prefer entity scope; it's the most reliable on event tables
         if entity_ids:
             hedge_events_query = hedge_events_query.in_("entity_id", list(entity_ids))
-        # Optionally filter by nav_type if present
         if nav_type:
-            hedge_events_query = _eq_if_exists(
-                supabase, "hedge_business_events", hedge_events_query, "nav_type", nav_type
-            )
-        # Order by first available timestamp-like column
+            hedge_events_query = _eq_if_exists(supabase, "hedge_business_events", hedge_events_query, "nav_type", nav_type)
         hedge_events_query = _order_if_exists(
-            supabase,
-            "hedge_business_events",
-            hedge_events_query,
-            candidates=[
-                "created_date", "created_at", "updated_date", "updated_at",
-                "event_timestamp", "event_time", "event_at"
-            ],
+            supabase, "hedge_business_events", hedge_events_query,
+            candidates=["created_date", "created_at", "updated_date", "updated_at", "event_timestamp", "event_at"],
             desc=True
         )
 
-        # CAR master: your error shows `effective_date` not present → use typical alternatives
+        # car_master — your DB lacks effective_date; use reporting_date/as_of_date/etc.
         car_master_query = (
             supabase.table("car_master")
             .select("*")
             .eq("currency_code", exposure_currency)
         )
         car_master_query = _order_if_exists(
-            supabase,
-            "car_master",
-            car_master_query,
+            supabase, "car_master", car_master_query,
             candidates=["reporting_date", "as_of_date", "effective_date", "created_date", "created_at"],
             desc=True
         )
 
-        # ===== STAGE 1A: THRESHOLD AND MONITORING =====
+        # ===== THRESHOLD & MONITORING =====
         threshold_query = (
             supabase.table("threshold_configuration")
             .select("*")
@@ -188,11 +182,15 @@ def fetch_complete_hedge_data(
             .eq("active_flag", "Y")
         )
         usd_pb_query = supabase.table("usd_pb_deposit").select("*")
-        risk_monitoring_query = (
-            supabase.table("risk_monitoring")
-            .select("*")
-            .eq("currency_code", exposure_currency)
-            .eq("monitoring_status", "Active")
+
+        # risk_monitoring — tolerate schemas without monitoring_status
+        risk_monitoring_query = supabase.table("risk_monitoring").select("*")
+        risk_monitoring_query = _eq_if_exists(
+            supabase, "risk_monitoring", risk_monitoring_query, "currency_code", exposure_currency
+        )
+        risk_monitoring_query = _eq_any_if_exists(
+            supabase, "risk_monitoring", risk_monitoring_query,
+            candidates_with_values=[("monitoring_status", "Active"), ("status", "Active"), ("active_flag", "Y")]
         )
 
         # ===== CURRENCY & RATES =====
@@ -206,9 +204,7 @@ def fetch_complete_hedge_data(
             .or_(f"currency_pair.eq.{exposure_currency}SGD,currency_pair.eq.SGD{exposure_currency}")
         )
         currency_rates_q = _order_if_exists(
-            supabase,
-            "currency_rates",
-            currency_rates_q,
+            supabase, "currency_rates", currency_rates_q,
             candidates=["effective_date", "rate_date", "as_of_date", "created_at"],
             desc=True
         ).limit(20)
@@ -231,13 +227,12 @@ def fetch_complete_hedge_data(
         if currency_type:
             booking_model_q = _eq_if_exists(supabase, "instruction_event_config", booking_model_q, "currency_type", currency_type)
 
-        murex_books_q = (
-            supabase.table("murex_book_config")
-            .select("*")
+        murex_books_q = supabase.table("murex_book_config").select("*")
+        # Handle both boolean and char flags
+        murex_books_q = _eq_any_if_exists(
+            supabase, "murex_book_config", murex_books_q,
+            candidates_with_values=[("active_flag", True), ("active_flag", "Y")]
         )
-        # active flag could be boolean or 'Y'
-        murex_books_q = _eq_if_exists(supabase, "murex_book_config", murex_books_q, "active_flag", True)
-        murex_books_q = _eq_if_exists(supabase, "murex_book_config", murex_books_q, "active_flag", "Y")
 
         hedge_instruments_query = (
             supabase.table("hedge_instruments")
@@ -252,14 +247,12 @@ def fetch_complete_hedge_data(
             .eq("currency_code", exposure_currency)
         )
         hedge_effectiveness_query = _order_if_exists(
-            supabase,
-            "hedge_effectiveness",
-            hedge_effectiveness_query,
+            supabase, "hedge_effectiveness", hedge_effectiveness_query,
             candidates=["effectiveness_date", "as_of_date", "created_at"],
             desc=True
         ).limit(10)
 
-        # ===== PROXY CURRENCIES (extra rates) =====
+        # ===== PROXY RATES (if any) =====
         currency_config = currency_config_q.execute()
         currency_config_rows = getattr(currency_config, "data", []) or []
         proxy_currencies = {c.get("proxy_currency") for c in currency_config_rows if c.get("proxy_currency")}
@@ -267,21 +260,20 @@ def fetch_complete_hedge_data(
 
         additional_rates_rows = []
         for proxy_ccy in proxy_currencies:
-            rate_result = (
+            rate_q = (
                 supabase.table("currency_rates")
                 .select("*")
                 .or_(f"currency_pair.eq.{proxy_ccy}SGD,currency_pair.eq.SGD{proxy_ccy}")
             )
-            rate_result = _order_if_exists(
-                supabase,
-                "currency_rates",
-                rate_result,
+            rate_q = _order_if_exists(
+                supabase, "currency_rates", rate_q,
                 candidates=["effective_date", "rate_date", "as_of_date", "created_at"],
                 desc=True
-            ).limit(10).execute()
-            additional_rates_rows += getattr(rate_result, "data", []) or []
+            ).limit(10)
+            rate_res = rate_q.execute()
+            additional_rates_rows += getattr(rate_res, "data", []) or []
 
-        # ===== EXECUTE REMAINING QUERIES =====
+        # ===== EXECUTE REMAINING =====
         buffer_config = buffer_config_query.execute()
         waterfall_config = waterfall_config_query.execute()
         overlay_config = overlay_config_query.execute()
@@ -294,7 +286,6 @@ def fetch_complete_hedge_data(
         try:
             hedge_events = hedge_events_query.execute()
         except Exception:
-            # Fallback to no filters if some optimistic filter still failed
             hedge_events = supabase.table("hedge_business_events").select("*").limit(50).execute()
 
         car_master = car_master_query.execute()
@@ -312,6 +303,7 @@ def fetch_complete_hedge_data(
         hedge_effectiveness = hedge_effectiveness_query.execute()
 
         # ===== EXTRACT ROWS =====
+        positions_rows = getattr(positions, "data", []) or []  # (re-assign for safety)
         buffer_config_rows = getattr(buffer_config, "data", []) or []
         waterfall_config_rows = getattr(waterfall_config, "data", []) or []
         overlay_config_rows = getattr(overlay_config, "data", []) or []
@@ -338,20 +330,19 @@ def fetch_complete_hedge_data(
             USD_PB_THRESHOLD = threshold_result.data[0].get("warning_level", 150000)
 
         return complete_structured_response(
-            # Core data
+            # Core
             entities_rows, positions_rows, currency_config_rows,
-            # Stage 1A Configuration
+            # Stage 1A cfg
             buffer_config_rows, waterfall_config_rows, overlay_config_rows,
             hedging_framework_rows, system_config_rows,
-            # Allocation and hedge data
+            # Stage 1B + history
             allocations_rows, hedge_instructions_rows, hedge_events_rows, car_master_rows,
-            # Thresholds and monitoring
+            # Thresholds + monitoring
             total_usd_pb_deposits_rows, risk_monitoring_rows, USD_PB_THRESHOLD,
-            # Currency and rates
+            # FX config + rates
             currency_rates_rows, proxy_config_rows, additional_rates_rows,
-            # Stage 2 booking
-            booking_model_config_rows, murex_books_rows, hedge_instruments_rows,
-            hedge_effectiveness_rows
+            # Stage 2
+            booking_model_config_rows, murex_books_rows, hedge_instruments_rows, hedge_effectiveness_rows
         )
 
     except Exception as e:
@@ -369,6 +360,10 @@ def fetch_complete_hedge_data(
             "error": str(e)
         }
 
+# ============================================================
+# Structuring & calculations
+# ============================================================
+
 def complete_structured_response(
     entities_rows, positions_rows, currency_config_rows,
     buffer_config_rows, waterfall_config_rows, overlay_config_rows,
@@ -379,7 +374,7 @@ def complete_structured_response(
     booking_model_config_rows, murex_books_rows, hedge_instruments_rows,
     hedge_effectiveness_rows
 ):
-    # Process entities with currency_type from joined data
+    # Entities with currency_type
     entity_info_lookup = {}
     for e in entities_rows:
         c_type = None
@@ -419,14 +414,14 @@ def complete_structured_response(
         if eid:
             buffer_rules[eid] = br
 
-    # CAR data by entity (latest row is already preferred due to ordering)
+    # CAR latest per entity (already ordered desc)
     car_data = {}
     for car in car_master_rows:
         eid = car.get("entity_id")
         if eid and eid not in car_data:
             car_data[eid] = car
 
-    # Group positions by entity and compute hedging state
+    # Group positions + compute state
     grouped = defaultdict(list)
     for pos in positions_rows:
         eid = pos.get("entity_id")
@@ -461,7 +456,7 @@ def complete_structured_response(
             "car_data": car_info
         })
 
-    # Build entity groups
+    # Entity groups
     entity_groups = []
     for eid, navs in grouped.items():
         entity = entity_info_lookup.get(eid, {})
@@ -491,7 +486,7 @@ def complete_structured_response(
         "excess_amount": max(0.0, total_usd_pb - USD_PB_THRESHOLD)
     }
 
-    # Waterfall config split
+    # Waterfall split
     waterfall_rules = {
         "opening": [w for w in (waterfall_config_rows or []) if w.get("waterfall_type") == "Opening"],
         "closing": [w for w in (waterfall_config_rows or []) if w.get("waterfall_type") == "Closing"]
@@ -530,7 +525,7 @@ def complete_structured_response(
     }
 
 def calculate_complete_hedging_state(position, allocation, hedge_relationships, framework_rule, buffer_rule, car_info):
-    """Calculate comprehensive hedging state for an entity position"""
+    """Comprehensive hedging state for an entity position"""
     current_position = float(position.get("current_position", 0) or 0)
     allocated_amount = float(allocation.get("hedge_amount_allocation", 0) or 0)
     available_for_hedging = float(allocation.get("available_amount_for_hedging", 0) or 0)
@@ -543,19 +538,20 @@ def calculate_complete_hedging_state(position, allocation, hedge_relationships, 
     if current_position > 0:
         hedge_utilization_pct = (hedged_position / current_position) * 100
 
-    hedging_status = "Available"
     if hedged_position >= current_position:
         hedging_status = "Fully_Hedged"
     elif hedged_position > 0:
         hedging_status = "Partially_Hedged"
     elif available_for_hedging <= 0:
         hedging_status = "Not_Available"
+    else:
+        hedging_status = "Available"
 
     framework_type = framework_rule.get("framework_type", "Not_Defined")
     buffer_percentage = buffer_rule.get("buffer_percentage", position.get("buffer_percentage", 0))
     car_exemption = framework_rule.get("car_exemption_flag", framework_rule.get("car_exemption_override", "N"))
 
-    # Available Amount = SFX Position - CAR Amount + Manual Overlay - Buffer Amount - Hedged Position
+    # Available = Position - CAR + Overlay - Buffer - Hedged
     calculated_available = current_position - car_amount + manual_overlay - buffer_amount - hedged_position
 
     return {
@@ -571,7 +567,7 @@ def calculate_complete_hedging_state(position, allocation, hedge_relationships, 
         "framework_type": framework_type,
         "car_exemption_flag": car_exemption,
         "framework_compliance": framework_type,
-        "last_allocation_date": allocation.get("created_date"),
+        "last_allocation_date": allocation.get("created_date") or allocation.get("created_at"),
         "waterfall_priority": allocation.get("waterfall_priority"),
         "allocation_sequence": allocation.get("allocation_sequence"),
         "allocation_status": allocation.get("allocation_status", "Pending"),
